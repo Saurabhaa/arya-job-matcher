@@ -8,8 +8,11 @@ from fastapi import APIRouter, File, Form, HTTPException, UploadFile
 from sse_starlette.sse import EventSourceResponse
 
 from app.config import settings
+from app.db.models import Job
 from app.db.session import SessionLocal
-from app.schemas import ShortlistItem
+from app.schemas import JobMatch, ShortlistItem
+from app.services.cache import get_match_cache, set_match_cache
+from app.services.llm import LLMRefusal, TokenUsage, match_job
 from app.services.matcher import shortlist
 from app.services.pdf import extract_text
 
@@ -18,7 +21,6 @@ log = logging.getLogger("arya.match")
 
 
 def _event(type_: str, data: Any) -> dict[str, str]:
-    """Wrap a payload in the locked SSEEvent shape, JSON-encoded for SSE."""
     return {"data": json.dumps({"type": type_, "data": data})}
 
 
@@ -34,7 +36,7 @@ async def _resume_text_from_request(
         raw = await file.read()
         try:
             text = extract_text(raw)
-        except Exception as e:  # pypdf raises a variety of errors on malformed PDFs
+        except Exception as e:
             raise HTTPException(status_code=400, detail=f"failed to parse PDF: {e}")
         if not text.strip():
             raise HTTPException(status_code=400, detail="no extractable text in PDF")
@@ -49,13 +51,35 @@ async def _resume_text_from_request(
     )
 
 
+async def _match_one(
+    job: Job,
+    resume_text: str,
+    resume_hash: str,
+    sem: asyncio.Semaphore,
+) -> tuple[Job, JobMatch | Exception, bool, TokenUsage | None]:
+    """Return (job, JobMatch|Exception, cache_hit, usage_or_None)."""
+    cached = await get_match_cache(resume_hash, job.id)
+    if cached is not None:
+        log.info("match cache hit resume=%s job=%d", resume_hash[:8], job.id)
+        return job, cached, True, None
+
+    log.info("match cache miss resume=%s job=%d", resume_hash[:8], job.id)
+    async with sem:
+        try:
+            result, usage = await match_job(resume_text, job)
+        except (LLMRefusal, Exception) as e:  # any error becomes a per-job error event
+            return job, e, False, None
+    await set_match_cache(resume_hash, job.id, result)
+    return job, result, False, usage
+
+
 async def _produce_events(
     resume_text: str,
     resume_hash: str,
     queue: asyncio.Queue,
 ) -> None:
-    """Stage-1 producer: shortlist over pgvector, push events to the queue."""
     try:
+        # Stage 1: shortlist
         async with SessionLocal() as session:
             pairs = await shortlist(resume_text, session, k=settings.SHORTLIST_SIZE)
 
@@ -71,13 +95,57 @@ async def _produce_events(
         log.info("shortlist ready: resume=%s items=%d", resume_hash[:8], len(items))
         await queue.put(_event("shortlist", items))
 
-        # Phase 2: no reasoning yet. Stub a done event so the stream closes.
-        await queue.put(_event("done", {}))
+        # Stage 2: parallel LLM, stream per-job events as they finish
+        sem = asyncio.Semaphore(settings.LLM_CONCURRENCY)
+        tasks = [
+            asyncio.create_task(_match_one(job, resume_text, resume_hash, sem))
+            for job, _ in pairs
+        ]
+
+        matches: list[JobMatch] = []
+        cache_hits = 0
+        cache_misses = 0
+        total_tokens_in = 0
+        total_tokens_out = 0
+
+        for fut in asyncio.as_completed(tasks):
+            job, result, hit, usage = await fut
+            if hit:
+                cache_hits += 1
+            else:
+                cache_misses += 1
+            if isinstance(result, Exception):
+                log.exception("match failed job=%d", job.id, exc_info=result)
+                await queue.put(
+                    _event(
+                        "error",
+                        {"job_id": job.id, "message": str(result) or type(result).__name__},
+                    )
+                )
+                continue
+            if usage is not None:
+                total_tokens_in += usage.prompt_tokens
+                total_tokens_out += usage.completion_tokens
+            matches.append(result)
+            await queue.put(_event("match", result.model_dump()))
+
+        # Final: top-5 by score desc
+        top5 = sorted(matches, key=lambda m: m.score, reverse=True)[:5]
+        stats = {
+            "cache_hits": cache_hits,
+            "cache_misses": cache_misses,
+            "total_tokens_in": total_tokens_in,
+            "total_tokens_out": total_tokens_out,
+        }
+        log.info("match done resume=%s stats=%s", resume_hash[:8], stats)
+        await queue.put(
+            _event("done", {"top5": [m.model_dump() for m in top5], "stats": stats})
+        )
     except Exception as e:
         log.exception("producer error")
         await queue.put(_event("error", {"message": str(e)}))
     finally:
-        await queue.put(None)  # sentinel
+        await queue.put(None)
 
 
 @router.post("/match")
