@@ -1,5 +1,7 @@
+import logging
 from contextlib import asynccontextmanager
 
+import sentry_sdk
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
@@ -8,11 +10,21 @@ from app.config import settings
 from app.db.models import Base
 from app.db.session import engine
 
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+)
+
+if settings.SENTRY_DSN:
+    sentry_sdk.init(
+        dsn=settings.SENTRY_DSN,
+        traces_sample_rate=1.0,  # demo: capture every match flow; ~0.1 in prod
+        send_default_pii=False,
+    )
+
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
-    # Schema bootstrap: fine for a demo. Phase 5 README documents that
-    # production would use Alembic instead.
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
     yield
