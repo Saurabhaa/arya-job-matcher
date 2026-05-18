@@ -1,277 +1,84 @@
 # Arya Job Matcher
 
-Upload or paste a resume; the app returns the top 5 matching jobs with personalized
-reasoning and one verbatim resume bullet to feature per match. Results stream
-progressively over SSE — no 30-second wall of nothing — and are cached so a
-re-run is effectively free.
+Upload or paste a resume. Get the top 5 matching jobs back with reasoning and one verbatim resume bullet to feature per match. Results stream in over SSE so you don't sit watching a spinner.
 
-Stack: FastAPI · async SQLAlchemy 2.0 · PostgreSQL 16 + pgvector · Redis 7 ·
-OpenAI (`gpt-5.4-mini` for reasoning, `text-embedding-3-small` for embeddings) ·
-Sentry · Vite + React 18 + TypeScript + Tailwind · docker-compose.
-
----
+FastAPI + async SQLAlchemy + Postgres/pgvector + Redis + OpenAI (gpt-5.4-mini for reasoning, text-embedding-3-small for embeddings) + Sentry. React + Vite + Tailwind on the front. docker-compose ties it together.
 
 ## Setup
 
-Five commands from a fresh clone to a working browser demo:
+Five commands from a clone:
 
 ```bash
-git clone <this-repo> arya && cd arya
-cp .env.example .env                # fill OPENAI_API_KEY (required) + SENTRY_DSN (optional)
+git clone <repo> arya && cd arya
+cp .env.example .env          # fill OPENAI_API_KEY (required), SENTRY_DSN (optional)
 docker compose up -d --build
 docker compose exec backend python -m app.scripts.seed_jobs
-open http://localhost:5173          # or visit it in your browser
+open http://localhost:5173
 ```
 
-The backend health endpoint is `http://localhost:8001/health`. The frontend talks
-to it directly (CORS allows `http://localhost:5173`).
+Health check: `curl http://localhost:8001/health`.
 
-### Note: host port 8001
-
-Port `8000` was already taken on the dev machine during the build, so
-[docker-compose.yml](docker-compose.yml) maps the backend as `8001:8000` (host:container).
-Container-side the backend still listens on `8000`; only the host port shifted.
-The frontend's SSE client and all curl commands in this README use `8001`. To
-revert: change the backend service's `ports` to `"8000:8000"` in
-`docker-compose.yml` and update `API_URL` in [frontend/src/lib/sse.ts](frontend/src/lib/sse.ts).
-
----
+One thing about the port. 8000 was taken on my dev machine, so docker-compose maps the backend as `8001:8000` — host 8001, container still 8000. If 8000 is free for you, change the backend service's `ports` in [docker-compose.yml](docker-compose.yml) to `"8000:8000"` and flip the `API_URL` constant in [frontend/src/lib/sse.ts](frontend/src/lib/sse.ts).
 
 ## Architecture
 
-The brief weights the architecture section heaviest, so this section treats the
-design as the primary deliverable rather than the code.
+This is the section the brief weights heaviest, so I'll spend the most time on it.
 
-### Pipeline at a glance
+The pipeline is two stages plus an SSE wrapper. Stage 1 embeds the resume and runs a single pgvector cosine query to pull the top 10 candidates by distance. Stage 2 fans out 10 OpenAI reasoning calls in parallel under a semaphore, collects results as they finish, sorts by score, and emits the top 5. Every transition emits an SSE event so the UI fills in progressively instead of blocking on the final answer.
 
-```
-  Resume (PDF or pasted text)
-        │
-        ▼
-  pypdf text extraction            ─┐
-  sha256 → resume_hash               │ Stage 0
-        │                            │ (request shaping)
-        ▼                           ─┘
-  OpenAI embed (cache-aware)       ─┐
-        │                            │ Stage 1: retrieval
-        ▼                            │ (cheap, deterministic, fast)
-  pgvector cosine  → top 10        ─┘
-        │
-        ▼                          ─┐
-  fan-out 10× async tasks            │
-  asyncio.Semaphore(5)               │ Stage 2: reasoning
-  OpenAI gpt-5.4-mini per job        │ (expensive, parallel)
-  (cache-aware, structured output) ─┘
-        │
-        ▼
-  sort by score → top 5 → done
-```
+The reason to do it in two stages is cost. At 25 jobs you could brute-force every job through the LLM for about $0.001 per match. At 20,000 jobs the same flow runs you about $0.80 per match and takes three minutes. Retrieve-then-rerank is the standard search-ranking pattern; it keeps the expensive token spend proportional to a fixed shortlist size regardless of corpus size. At 20k rows you swap the seq-scan for an HNSW index — one DDL change, no pipeline change.
 
-Every transition above also emits an SSE event so the UI fills in
-progressively (`shortlist` → 10 × `match` → `done`).
+I picked OpenAI for both stages because single-vendor means one SDK, one credential, one billing surface. Embeddings via text-embedding-3-small, reasoning via gpt-5.4-mini. Mini is the right size when you're firing 10 parallel calls per match — bigger models would be overkill and slower. Structured output via `client.chat.completions.parse(response_format=_LLMOutput)` gives a typed Pydantic instance at decode time, which kills the parser-and-retry-on-malformed-JSON dance. The reasoning layer is provider-agnostic at the [services/llm.py](backend/app/services/llm.py) boundary; swapping to Anthropic or Gemini is a one-file change.
 
-### Two-stage retrieval (and why it generalizes)
+One design refinement worth calling out. The locked `JobMatch` contract has six fields. The LLM only produces three of them — score, reasoning, highlight_bullet — via a smaller internal schema. The server fills in job_id, title, and company from the DB row it already has. This saves prompt tokens on every call and removes a class of hallucination (drifted company name, wrong id) the model would otherwise be free to commit. The SSE contract over the wire still ships the full `JobMatch`.
 
-At N=25 jobs we could brute-force every job through the LLM — about $0.001 per
-match. At N=20,000 that becomes $0.80 per match in OpenAI tokens alone, and
-~3 minutes of latency. The two-stage pattern is the same code at both scales:
+I skipped LangChain and LangGraph. The brief invited it. The orchestrator is retrieve, fan out, reduce — about 30 lines of asyncio in [api/match.py](backend/app/api/match.py). There's no loop, no branch, no tool-call planner. LangGraph would add a state-machine abstraction and a debugging surface for a flow that doesn't need either.
 
-1. **Stage 1 — vector shortlist.** Embed the resume once, run a single SQL
-   query (`embedding <=> :vec`) to pull the top 10 candidates by cosine
-   distance. Cheap, deterministic, single round-trip. At 25 rows it's a
-   seq-scan; at 20k it becomes an HNSW or IVF-Flat index lookup — one DDL
-   change, no pipeline change.
-2. **Stage 2 — Claude-grade reasoning, in parallel.** Fan 10 OpenAI calls out
-   under an `asyncio.Semaphore(5)` so we don't melt the rate limit. Use
-   `asyncio.as_completed` (not `gather`) so each result hits the SSE queue as
-   it lands. Sort by score, take top 5, emit `done`.
+SSE over WebSocket because the channel is one-way (server to browser), HTTP-native, and proxy-friendly. You can't use a stock `EventSource` here because it doesn't support POST or multipart, so the frontend reads the response body with `fetch` + `getReader()` and parses the SSE format by hand.
 
-This is the standard "retrieve → rerank" pattern from search ranking, mapped
-onto LLM reasoning. It keeps the expensive token spend proportional to a fixed
-shortlist size regardless of corpus size.
-
-### Why OpenAI (single vendor, both stages)
-
-One SDK, one credential, one billing surface. Embeddings via
-`text-embedding-3-small` (1536-dim, cheap, well-clustered). Reasoning via
-`gpt-5.4-mini` — strong fit-evaluation quality per dollar, and the
-mini size is the right call when you're firing 10 parallel calls per match
-flow. Structured outputs via `client.chat.completions.parse(..., response_format=_LLMOutput)`
-give a typed Pydantic instance at decode time: no JSON-parser, no retry-on-malformed,
-no `json.loads(re.search(r'\{.*\}', ...))` hellscape.
-
-The reasoning layer is provider-agnostic at the
-[services/llm.py](backend/app/services/llm.py) boundary — swapping to
-Anthropic, Gemini, or a local model is a single-file change. The orchestrator
-only cares about the `JobMatch` schema coming back.
-
-**Design refinement (Phase 3).** The locked `JobMatch` contract has six
-fields (`job_id`, `title`, `company`, `score`, `reasoning`, `highlight_bullet`).
-The LLM only produces the three creative ones (`score`, `reasoning`,
-`highlight_bullet`) via a smaller internal `_LLMOutput` schema; the server
-fills in `job_id` / `title` / `company` from the DB row it already has. This
-saves tokens on every call and removes a class of hallucinations the model
-would otherwise be free to commit (wrong id, drifted company name). The locked
-SSE contract is unchanged.
-
-### Why no LangChain / LangGraph
-
-The brief explicitly invites skipping the agent-framework layer. The whole
-orchestrator is **retrieve → fan-out → reduce** — about 30 lines of
-`asyncio` in [api/match.py](backend/app/api/match.py). LangGraph would add a
-dependency, a state-machine abstraction, and a debugging surface for a flow
-that doesn't loop, doesn't branch, and doesn't need a tool-call planner.
-"You can use plain async" is a valid answer to the prompt.
-
-### Why SSE over WebSocket
-
-This is one-way push (server → browser). HTTP-native, no upgrade handshake,
-proxy-friendly, and `fetch` + `ReadableStream` parses it client-side without an
-EventSource (which we couldn't use anyway — `EventSource` doesn't support
-`POST` or `multipart/form-data`). WebSocket would buy us a reverse channel we
-don't need.
-
-### Two cache layers
+There are two cache layers, and they pull most of the weight in this system:
 
 | Layer | Key | TTL | What it saves |
 |---|---|---|---|
-| Embeddings | `embed:{sha256(text)}` | 7 days | One OpenAI embed call per unique resume text **and** per unique job text. Job embeddings are cached during seed; re-seeding the same `jobs.json` is free. |
-| Match results | `match:{resume_hash}:{job_id}` | 24 hours | The expensive bit: one full `gpt-5.4-mini` reasoning call per (resume, job) pair. A cached re-run skips all 10 calls. |
+| Embeddings | embed:{sha256(text)} | 7d | One OpenAI embed call per unique resume text, and per unique job text on seed |
+| Match results | match:{resume_hash}:{job_id} | 24h | The expensive bit — one full gpt-5.4-mini call per (resume, job) pair |
 
-**Headline number:** a fresh match takes ~7.8 seconds (10 parallel OpenAI
-reasoning calls bottlenecked at concurrency=5). A cached re-run of the same
-resume returns in ~52 ms. That's a **~150× speedup** and is the single most
-visible win from running this end-to-end in the browser.
+A fresh match takes about 7.8 seconds end to end, bottlenecked by 10 OpenAI calls at concurrency 5. A cached re-run of the same resume returns in about 52 ms. That's roughly 150× and it's the single most visible win from the cache layer.
 
-### Sentry transaction design
+Observability runs through one Sentry transaction per match flow, named `match_resume_to_jobs`, op `match`. Each of the 10 LLM calls is a child span (op `llm.match_job`, description `job_id=N`), so per-call latency is visible in the waterfall. `traces_sample_rate=1.0` for this demo — in production it would be closer to 0.1 with tail-based sampling of error transactions. The transaction carries eight tags so a single record tells you everything about the flow:
 
-Each `/api/match` invocation produces exactly one Sentry transaction named
-`match_resume_to_jobs` (op `match`), with 10 child spans
-(op `llm.match_job`, description `job_id=N`) so per-call latency is visible in
-the waterfall. `traces_sample_rate=1.0` for the demo; in production this
-should be `~0.1` plus tail-based sampling of error transactions.
-
-The transaction carries these tags at finish — designed so a single
-transaction tells you everything you need to know about that flow without
-clicking into the spans:
-
-| Tag | Why it's here |
+| Tag | Why |
 |---|---|
-| `shortlist_size` | Sanity-check that Stage 1 returned what we expected (always 10 in this build). |
-| `cache_hits` | Counts how many of the 10 jobs hit the result cache. The headline cache-efficacy number. |
-| `cache_misses` | Inverse of above; together they let you compute cache ratio without doing arithmetic. |
-| `total_tokens_in` | OpenAI prompt-token spend across all 10 reasoning calls in this flow. |
-| `total_tokens_out` | OpenAI completion-token spend. The reasoning + bullet text. |
-| `estimated_usd` | `(in × $0.75 + out × $4.50) / 1M`. A real dollar number per match flow — the most useful tag for budget conversations. |
-| `resume_hash_prefix` | First 8 hex chars of the resume hash. Lets you correlate flows for the same resume without storing the resume itself. |
-| `reasoning_model` | The exact model id from config. Makes it trivial to filter the dashboard when you swap models or A/B test. |
+| shortlist_size | Sanity-check that Stage 1 returned what we expected |
+| cache_hits | The headline cache-efficacy number |
+| cache_misses | Lets you compute the ratio without arithmetic |
+| total_tokens_in | Prompt-token spend across the 10 calls |
+| total_tokens_out | Completion-token spend |
+| estimated_usd | (in × $0.75 + out × $4.50) / 1M — a real dollar per flow |
+| resume_hash_prefix | First 8 hex chars; lets you correlate without storing the resume |
+| reasoning_model | The exact model id; useful when A/B-ing models |
 
-Per-job spans also carry a `cache=hit|miss` tag and (on success) a `score=N`
-tag, so you can drill from "cheap flow" → "which jobs were the cache hits" in
-two clicks.
+Per-job spans also carry `cache=hit|miss` and (on success) `score=N`, so you can drill from "cheap flow" to "which jobs were the cache hits" in a couple of clicks.
 
-### Locked contracts
+The Pydantic models in [backend/app/schemas.py](backend/app/schemas.py) and the matcher system prompt in [services/llm.py](backend/app/services/llm.py) were written once and not edited mid-build. Prompt edits cause silent score drift; contract edits cause silent serialization bugs in the frontend. Both stay pinned.
 
-[schemas.py](backend/app/schemas.py) was written first and not touched after:
-`JobMatch` (the per-match payload), `ShortlistItem` (Stage 1 result),
-`SSEEvent` (the discriminated union on the wire). The matcher system prompt
-in [services/llm.py](backend/app/services/llm.py) is also a locked contract —
-prompt edits during a build cause silent score drift. Both are pinned and
-documented to be left alone outside of explicit prompt-versioning work.
+## What I'd do with another week
 
----
+- HNSW or IVF-Flat index on the embedding column. At 25 rows it doesn't matter; at 20k it does.
+- Hybrid BM25 + vector retrieval, fused with reciprocal rank fusion. Vectors miss literal keywords — a candidate searching "Kafka" shouldn't lose to "event-driven streaming platforms".
+- Eval harness — gold-standard (resume, job, expected score band) tuples and rank-correlation tracking across releases. Without this, prompt tweaks are vibes.
+- Prompt versioning and A/B infra. The matcher prompt is a load-bearing string and deserves a version field.
+- Per-tenant cache namespacing the moment a second customer joins.
+- Benchmark gpt-5.5 for reasoning when quality matters more than cost.
+- Stream OpenAI's token output as a separate SSE event per match so the reasoning paragraph types in. Better demo, marginal real value.
+- Retry/backoff on OpenAI 429s. Right now a 429 surfaces as a per-job error event.
+- Layout-aware PDF parser (Unstructured, LlamaParse). pypdf is brittle on two-column resumes.
+- text-embedding-3-large if shortlist precision starts to matter more than cost.
 
-## What I'd do differently with one more week
+## Known issues
 
-- **HNSW or IVF-Flat index** on the `embedding` column. At 25 rows pgvector
-  seq-scans in microseconds, but the index is the production-ready answer.
-- **Hybrid retrieval.** BM25 over `title || description` plus the vector
-  shortlist, fused via reciprocal rank fusion. Vector embeddings miss
-  literal-keyword matches (a candidate searching for "Kafka" should not lose
-  to "event-driven streaming platforms").
-- **Eval harness.** Gold-standard (resume, job, expected score band) tuples;
-  measure rank correlation between human judgments and model scores per
-  release. Without this, "prompt tweaks" are vibes.
-- **Prompt versioning + A/B testing.** The matcher prompt is a load-bearing
-  string. It deserves a version field, a registry, and a way to run two
-  prompts side-by-side on the same shortlist.
-- **Per-tenant cache namespacing.** `match:{tenant}:{resume_hash}:{job_id}`
-  the day a second customer joins.
-- **Try `gpt-5.5` for reasoning** when quality matters more than speed/cost,
-  benchmark vs. mini on the eval harness, decide by p50 fit-score correlation
-  and dollars per match.
-- **Stream OpenAI's token output** as a separate SSE event per match so the
-  reasoning paragraph types in as the model produces it. Better demo,
-  marginal real value, hence not built.
-- **Rate limiting + retry/backoff** on OpenAI 429s. Currently a 429 surfaces
-  as a per-job `error` event and the flow continues; the right answer is
-  exponential backoff with jitter.
-- **Layout-aware PDF parser** (Unstructured.io, LlamaParse). pypdf is fine
-  for single-column resumes, brittle for two-column / table-heavy ones.
-- **`text-embedding-3-large`** if shortlist precision turns out to matter
-  more than cost — at 20k jobs it pays for itself by promoting fewer false
-  positives into the expensive Stage 2.
+pypdf doesn't OCR, so scanned PDFs return empty text and the request 400s.
 
----
+No rate limiting on `/api/match`. No retry/backoff on upstream OpenAI errors — they bubble out as per-job `error` events on the SSE stream. Models aren't per-request configurable; the model id is a process-level env var. `jobs.json` loads via the seed script only — no admin UI. The 24-hour result-cache TTL is arbitrary; the right number is a function of model-release cadence more than anything else. The DB schema gets created via `Base.metadata.create_all` on startup, which is fine for a demo and not fine for production — Alembic is the right answer there.
 
-## Known issues / limitations / chose-not-to-fix
-
-- pypdf doesn't OCR; **scanned/image-based PDFs** return empty text and the
-  request 400s.
-- **No rate limiting** on `/api/match`. A demo, not a production endpoint.
-- **No retry/backoff** on upstream OpenAI errors. They surface to the client
-  as per-job `error` events.
-- **Models are not per-request configurable.** `OPENAI_REASONING_MODEL` is a
-  process-level env var.
-- **`jobs.json` is loaded only via the seed script.** No admin UI, no
-  refresh endpoint.
-- **24-hour result-cache TTL is arbitrary.** Resume content rarely changes,
-  but model versions do; the right number is a function of model-release
-  cadence.
-- **DB schema via `Base.metadata.create_all` on startup.** Acceptable for a
-  demo, not for prod — production deserves Alembic.
-
-### Lessons learned (worth documenting)
-
-- **sse-starlette emits `\r\n\r\n` between events** — canonical SSE — but a
-  naive parser that splits on `\n\n` silently matches nothing and never
-  fires any `onEvent`. The frontend SSE parser in
-  [frontend/src/lib/sse.ts](frontend/src/lib/sse.ts) splits on `/\r?\n\r?\n/`
-  and also drains buffer + flushes the decoder after `done`, so trailing
-  events aren't dropped on stream close. Worth two minutes' staring at hex
-  bytes if you ever see "DevTools shows N chunks but UI renders zero cards."
-
----
-
-## File map
-
-```
-backend/
-  app/
-    api/match.py            POST /api/match — SSE producer + orchestrator
-    db/
-      models.py             Job (pgvector Vector(1536))
-      session.py            async engine
-    services/
-      pdf.py                pypdf text extraction
-      embeddings.py         OpenAI embed + Redis cache
-      llm.py                OpenAI reasoning + structured output + locked prompt
-      cache.py              match result cache helpers
-      matcher.py            pgvector shortlist
-    main.py                 FastAPI, Sentry init, CORS, lifespan
-    config.py               pydantic-settings
-    schemas.py              locked Pydantic contracts
-    scripts/seed_jobs.py    one-shot: embed + upsert jobs.json
-frontend/
-  src/
-    types.ts                TS mirrors of locked contracts
-    lib/sse.ts              fetch + ReadableStream SSE consumer
-    components/
-      ResumeInput.tsx       upload/paste tabs
-      MatchCard.tsx         score badge + reasoning + verbatim bullet
-    App.tsx                 phase machine (idle → running → done)
-docker-compose.yml          db, redis, backend, frontend
-init.sql                    CREATE EXTENSION vector
-jobs.json                   25 sample jobs (given)
-BUILD_PLAN_updated.md       Phased build spec (v3)
-```
+One thing worth writing down for the next person. sse-starlette emits canonical SSE with `\r\n\r\n` between events. A naive frontend parser that splits on `\n\n` will silently match nothing and never fire `onEvent`, which presents in DevTools as "stream looks fine, UI renders zero cards." The parser in [frontend/src/lib/sse.ts](frontend/src/lib/sse.ts) splits on `/\r?\n\r?\n/` and drains the buffer after the stream closes so trailing events aren't dropped. I lost an hour to that.
