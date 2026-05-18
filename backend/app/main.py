@@ -3,6 +3,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
+from app.api.match import router as match_router
 from app.config import settings
 from app.db.models import Base
 from app.db.session import engine
@@ -31,3 +32,6 @@ app.add_middleware(
 @app.get("/health")
 async def health() -> dict[str, str]:
     return {"status": "ok"}
+
+
+app.include_router(match_router)

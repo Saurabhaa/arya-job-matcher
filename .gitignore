@@ -8,3 +8,6 @@ dist/
 .vite/
 .DS_Store
 *.egg-info/
+
+# local test artifacts
+resume.pdf

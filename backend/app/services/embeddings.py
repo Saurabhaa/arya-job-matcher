@@ -1,10 +1,13 @@
 import hashlib
 import json
+import logging
 
 from openai import AsyncOpenAI
 from redis.asyncio import Redis
 
 from app.config import settings
+
+log = logging.getLogger("arya.embeddings")
 
 EMBED_TTL_SECONDS = 7 * 24 * 3600
 
@@ -35,8 +38,10 @@ async def embed(text: str) -> list[float]:
     cache = _cache()
     cached = await cache.get(key)
     if cached:
+        log.info("embed cache hit key=%s", key)
         return json.loads(cached)
 
+    log.info("embed cache miss key=%s", key)
     resp = await _client().embeddings.create(
         model=settings.EMBEDDING_MODEL,
         input=text,
