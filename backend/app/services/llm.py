@@ -41,7 +41,11 @@ Given a RESUME and a JOB_DESCRIPTION, return JSON with three fields:
    would be the strongest line to feature in a cover letter for THIS specific
    role. Copy it word-for-word — do not paraphrase, do not summarize. Pick the
    bullet whose specifics (numbers, technologies, outcomes) align most
-   closely with what the job is asking for.
+   closely with what the job is asking for. If the resume has multiple bullets
+   that are roughly tied for this role, prefer one that is less obviously
+   universal so the same bullet does not get reused across many different
+   roles — unless one bullet is the genuinely strongest fit and reuse is
+   warranted.
 
 Return ONLY the JSON object. No preamble, no explanation, no markdown fences.
 """

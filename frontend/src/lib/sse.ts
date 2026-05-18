@@ -31,30 +31,43 @@ export async function streamMatch(
   const decoder = new TextDecoder();
   let buf = "";
 
-  // SSE messages are delimited by a blank line. Each message can carry
-  // multiple `data:` lines whose values are concatenated with newlines.
-  while (true) {
-    const { value, done } = await reader.read();
-    if (done) break;
-    buf += decoder.decode(value, { stream: true });
+  // SSE messages are delimited by a blank line. sse-starlette emits CRLF
+  // (`\r\n\r\n`); the spec also allows LF-only (`\n\n`). Match both.
+  const delim = /\r?\n\r?\n/;
 
-    let sep: number;
-    while ((sep = buf.indexOf("\n\n")) !== -1) {
-      const raw = buf.slice(0, sep);
-      buf = buf.slice(sep + 2);
+  const flush = () => {
+    while (true) {
+      const m = buf.match(delim);
+      if (!m) return;
+      const idx = m.index!;
+      const raw = buf.slice(0, idx);
+      buf = buf.slice(idx + m[0].length);
       const payload = raw
-        .split("\n")
+        .split(/\r?\n/)
         .filter((l) => l.startsWith("data:"))
         .map((l) => l.slice(5).replace(/^ /, ""))
         .join("\n")
         .trim();
       if (!payload) continue;
       try {
-        const evt = JSON.parse(payload) as SSEEvent;
-        onEvent(evt);
+        onEvent(JSON.parse(payload) as SSEEvent);
       } catch (err) {
         console.error("sse parse error", err, payload);
       }
     }
+  };
+
+  while (true) {
+    const { value, done } = await reader.read();
+    if (value) buf += decoder.decode(value, { stream: true });
+    flush();
+    if (done) break;
+  }
+  // Flush any trailing UTF-8 bytes and parse any tail event missing a
+  // blank-line terminator (sse-starlette always sends one, but be safe).
+  buf += decoder.decode();
+  if (buf.trim()) {
+    buf += "\n\n";
+    flush();
   }
 }
