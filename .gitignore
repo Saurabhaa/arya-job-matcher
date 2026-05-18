@@ -11,3 +11,5 @@ dist/
 
 # local test artifacts
 resume.pdf
+
+.claude/
